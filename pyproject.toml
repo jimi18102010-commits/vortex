@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vortex"
+version = "0.1.0"
+description = "⚡ VORTEX: Edge Anycast L4/L7 Reverse-Proxy & eBPF DDoS Shield"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "jimmiy", email = "jimi18102010@gmail.com" }
+]
+keywords = ["ebpf", "xdp", "reverse-proxy", "ddos-mitigation", "ja4", "ja3", "security", "cloudflare-alternative"]
+dependencies = [
+    "rich>=13.7.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.23.0"
+]
+
+[project.scripts]
+vortex = "vortex.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["vortex*"]
+exclude = ["kernel*", "tests*"]
