@@ -19,7 +19,7 @@ jobs:
     - name: Install Clang & BPF tools
       run: |
         sudo apt-get update
-        sudo apt-get install -y clang llvm libbpf-dev linux-tools-generic
+        sudo apt-get install -y clang llvm libbpf-dev linux-tools-generic gcc-multilib
 
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v5
