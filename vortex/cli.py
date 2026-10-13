@@ -52,18 +52,18 @@ async def run_shield_with_ui(listen_port: int, upstream_host: str, upstream_port
 
 def main():
     parser = argparse.ArgumentParser(
-        description="⚡ VORTEX: Edge Anycast L4/L7 Reverse-Proxy & eBPF DDoS Shield"
+        description="VORTEX: experimental TCP proxy, TLS telemetry & optional IPv4 XDP blacklist"
     )
     subparsers = parser.add_subparsers(dest="command", help="Command to execute")
 
     # 1. Run Command
-    run_parser = subparsers.add_parser("run", help="Start the reverse proxy shield and live radar")
+    run_parser = subparsers.add_parser("run", help="Start the TCP proxy and TLS telemetry dashboard")
     run_parser.add_argument("-p", "--port", type=int, default=8080, help="Listen port (default: 8080)")
     run_parser.add_argument("-u", "--upstream", default="127.0.0.1:80", help="Upstream host:port (default: 127.0.0.1:80)")
     run_parser.add_argument("-i", "--interface", default="lo", help="Network interface for L4 XDP (default: lo)")
 
     # 2. Benchmark / Test Flood Command
-    test_parser = subparsers.add_parser("test-attack", help="Simulate a high-speed L4/L7 flood to test shield mitigation")
+    test_parser = subparsers.add_parser("test-attack", help="Run a loopback-only synthetic connection test")
     test_parser.add_argument("-p", "--port", type=int, default=8080, help="Target port (default: 8080)")
     test_parser.add_argument("-c", "--concurrency", type=int, default=50, help="Simultaneous connections")
     test_parser.add_argument("-n", "--requests", type=int, default=500, help="Total requests to fire")

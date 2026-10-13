@@ -1,6 +1,6 @@
 """
 Cyberpunk Terminal Radar TUI for Project VORTEX.
-Renders real-time live telemetry, packet rates, TLS fingerprints, and security alerts.
+Renders real-time live telemetry, userspace stream-event rates, TLS fingerprints, and security alerts.
 """
 import time
 from collections import deque
@@ -77,7 +77,7 @@ class VortexRadarTUI:
         stats = self.proxy.shield.get_stats()
         header_text = Text()
         header_text.append("⚡ VORTEX SHIELD ", style="bold red")
-        header_text.append(":: Edge Anycast L4/L7 Reverse-Proxy & Threat Radar\n", style="bold white")
+        header_text.append(":: Experimental TCP Proxy & TLS Telemetry\n", style="bold white")
         header_text.append(f"• Uptime: {uptime}s  ", style="dim")
         header_text.append(f"• Engine: {self.proxy.listen_host}:{self.proxy.listen_port} ➔ {self.proxy.upstream_host}:{self.proxy.upstream_port}  ", style="cyan")
         header_text.append(f"• L4 Mode: [{stats['mode'].upper()}] on [{stats['interface']}]", style="bold green" if "xdp" in stats['mode'] else "bold yellow")
@@ -89,10 +89,10 @@ class VortexRadarTUI:
         telemetry_table.add_column(style="bold cyan", width=18)
         telemetry_table.add_column(style="bold white")
 
-        telemetry_table.add_row("Packets/Sec (PPS):", f"[bold green]{self.current_pps:,}[/]")
-        telemetry_table.add_row("Drop Rate (DPS):", f"[bold red]{self.current_dps:,}[/]")
-        telemetry_table.add_row("Total Forwarded:", f"{stats['passed_packets']:,} packets")
-        telemetry_table.add_row("Total Wire Dropped:", f"[bold red]{stats['dropped_packets']:,}[/] packets")
+        telemetry_table.add_row("Stream chunks/sec:", f"[bold green]{self.current_pps:,}[/]")
+        telemetry_table.add_row("Blocked conns/sec:", f"[bold red]{self.current_dps:,}[/]")
+        telemetry_table.add_row("Forwarded chunks:", f"{stats['passed_packets']:,} chunks")
+        telemetry_table.add_row("Blocked connections:", f"[bold red]{stats['dropped_packets']:,}[/] connections")
         telemetry_table.add_row("Total Ingress:", f"{stats['rx_bytes'] / (1024*1024):.2f} MB")
         telemetry_table.add_row("Active Connections:", f"[bold yellow]{self.proxy.active_connections}[/]")
         telemetry_table.add_row("L4 Banned IPs:", f"[bold magenta]{stats['blocked_count']}[/]")
@@ -108,7 +108,7 @@ class VortexRadarTUI:
 
         left_content = Layout()
         left_content.split_column(
-            Layout(Panel(telemetry_table, title="[bold]Metrics & Wire Rates[/bold]", border_style="cyan"), ratio=1),
+            Layout(Panel(telemetry_table, title="[bold]Userspace stream metrics[/bold]", border_style="cyan"), ratio=1),
             Layout(Panel(log_table, title="[bold]Shield Events Log[/bold]", border_style="dim"), ratio=1)
         )
         layout["telemetry"].update(left_content)
@@ -117,7 +117,7 @@ class VortexRadarTUI:
         tls_table = Table(title="Live TLS ClientHello & JA4 Fingerprint Stream", border_style="red", expand=True)
         tls_table.add_column("Time", style="dim", width=8)
         tls_table.add_column("Client IP", style="cyan", width=15)
-        tls_table.add_column("Identified Client / Tool", width=22)
+        tls_table.add_column("Heuristic Client / Tool", width=22)
         tls_table.add_column("JA4 Signature", style="dim", width=28)
         tls_table.add_column("Risk", justify="center", width=10)
 
@@ -136,7 +136,7 @@ class VortexRadarTUI:
 
         # 4. Footer
         footer_text = Text()
-        footer_text.append("Press Ctrl+C to stop shield | Architecture: eBPF XDP Driver ➔ Zero-Copy Stream ➔ JA4 Telemetry", style="dim")
+        footer_text.append("Press Ctrl+C to stop shield | Optional IPv4 XDP blacklist ➔ buffered TCP forwarding ➔ TLS telemetry", style="dim")
         layout["footer"].update(Panel(footer_text, border_style="dim"))
 
         return layout

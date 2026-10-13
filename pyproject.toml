@@ -29,3 +29,6 @@ vortex = "vortex.cli:main"
 [tool.setuptools.packages.find]
 include = ["vortex*"]
 exclude = ["kernel*", "tests*"]
+
+[tool.setuptools.data-files]
+"share/vortex/kernel" = ["kernel/xdp_filter.c"]

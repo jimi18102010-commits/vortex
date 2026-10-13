@@ -1,197 +1,123 @@
-"""
-Binary wire-level TLS ClientHello parser & JA3/JA4 fingerprinting engine.
-Extracts cipher suites, extensions, elliptic curves and point formats directly
-from initial TCP stream bytes without full SSL termination.
-"""
+"""Bounded TLS ClientHello parsing and JA3/JA4 telemetry (not client identity)."""
 import hashlib
 import struct
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
+
 
 class TLSClientHelloSniffer:
-    # Grease values defined in RFC 8701
-    GREASE_TABLE = {
-        0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a,
-        0x8a8a, 0x9a9a, 0xaaaa, 0xbaba, 0xcaca, 0xdada, 0xeaea, 0xfafa
-    }
+    GREASE_TABLE = {0x0a0a + 0x1010 * i for i in range(16)}
+    MAX_HELLO_BYTES = 65536
 
     @classmethod
     def is_client_hello(cls, data: bytes) -> bool:
-        """Check if incoming TCP bytes begin with a TLS Record ClientHello."""
-        if len(data) < 9:
-            return False
-        content_type = data[0]
-        # 0x16 = Handshake record
-        if content_type != 0x16:
-            return False
-        major, minor = data[1], data[2]
-        # SSL 3.0 or TLS 1.0 - 1.3 (0x03, 0x00..0x03)
-        if major != 3:
-            return False
-        handshake_type = data[5]
-        # 0x01 = ClientHello
-        return handshake_type == 0x01
+        return len(data) >= 6 and data[0] == 22 and data[1] == 3 and data[5] == 1
+
+    @classmethod
+    def _handshake(cls, data):
+        payload = bytearray()
+        offset = 0
+        while offset + 5 <= len(data):
+            if data[offset] != 22 or data[offset + 1] != 3:
+                return None
+            length = int.from_bytes(data[offset + 3:offset + 5], 'big')
+            if length == 0 or length > 18432 or offset + 5 + length > len(data):
+                return None
+            payload.extend(data[offset + 5:offset + 5 + length])
+            if len(payload) > cls.MAX_HELLO_BYTES:
+                return None
+            if len(payload) >= 4:
+                required = 4 + int.from_bytes(payload[1:4], 'big')
+                if payload[0] != 1 or required > cls.MAX_HELLO_BYTES:
+                    return None
+                if len(payload) >= required:
+                    return bytes(payload[4:required])
+            offset += 5 + length
+        return None
 
     @classmethod
     def parse_client_hello(cls, data: bytes) -> Optional[dict]:
-        """
-        Parse raw bytes of TLS ClientHello record.
-        Returns dictionary containing:
-        - version: int
-        - ciphers: List[int]
-        - extensions: List[int]
-        - curves: List[int]
-        - point_formats: List[int]
-        - sni: Optional[str]
-        - ja3_string: str
-        - ja3_hash: str (MD5)
-        - ja4_string: str
-        """
-        if not cls.is_client_hello(data):
+        hello = cls._handshake(data)
+        if hello is None:
             return None
-
         try:
-            record_len = struct.unpack("!H", data[3:5])[0]
-            if len(data) < 5 + record_len:
-                # Truncated or incomplete packet
-                pass
-
-            offset = 5 # Start of handshake message
-            handshake_type = data[offset]
-            if handshake_type != 1:
-                return None
-            offset += 1
-
-            # 3 bytes handshake length
-            handshake_len = (data[offset] << 16) | (data[offset + 1] << 8) | data[offset + 2]
-            offset += 3
-
-            # Client Version (2 bytes)
-            client_version = struct.unpack("!H", data[offset:offset+2])[0]
-            offset += 2
-
-            # Random (32 bytes)
-            offset += 32
-
-            # Session ID
-            session_id_len = data[offset]
-            offset += 1 + session_id_len
-
-            # Cipher Suites
-            ciphers_len = struct.unpack("!H", data[offset:offset+2])[0]
-            offset += 2
-            ciphers = []
-            for i in range(0, ciphers_len, 2):
-                c = struct.unpack("!H", data[offset+i:offset+i+2])[0]
-                if c not in cls.GREASE_TABLE:
-                    ciphers.append(c)
-            offset += ciphers_len
-
-            # Compression Methods
-            comp_len = data[offset]
-            offset += 1
-            compressions = list(data[offset:offset+comp_len])
-            offset += comp_len
-
-            # Extensions
-            extensions = []
-            curves = []
-            point_formats = []
-            sni = None
-            alpn = None
-
-            if offset + 2 <= len(data):
-                ext_total_len = struct.unpack("!H", data[offset:offset+2])[0]
-                offset += 2
-                end_ext = offset + ext_total_len
-
-                while offset + 4 <= min(end_ext, len(data)):
-                    ext_type = struct.unpack("!H", data[offset:offset+2])[0]
-                    ext_len = struct.unpack("!H", data[offset+2:offset+4])[0]
-                    offset += 4
-
-                    if ext_type not in cls.GREASE_TABLE:
-                        extensions.append(ext_type)
-
-                    ext_data = data[offset:offset+ext_len]
-
-                    # SNI (Extension 0)
-                    if ext_type == 0 and len(ext_data) > 2:
-                        try:
-                            # server_name_list
-                            list_len = struct.unpack("!H", ext_data[0:2])[0]
-                            if len(ext_data) >= 5 and ext_data[2] == 0: # host_name
-                                name_len = struct.unpack("!H", ext_data[3:5])[0]
-                                sni = ext_data[5:5+name_len].decode("utf-8", errors="ignore")
-                        except Exception:
-                            pass
-
-                    # Supported Groups / Elliptic Curves (Extension 10)
-                    elif ext_type == 10 and len(ext_data) >= 2:
-                        curves_len = struct.unpack("!H", ext_data[0:2])[0]
-                        for c_i in range(2, min(2 + curves_len, len(ext_data)), 2):
-                            curve_id = struct.unpack("!H", ext_data[c_i:c_i+2])[0]
-                            if curve_id not in cls.GREASE_TABLE:
-                                curves.append(curve_id)
-
-                    # EC Point Formats (Extension 11)
-                    elif ext_type == 11 and len(ext_data) >= 1:
-                        pf_len = ext_data[0]
-                        point_formats = list(ext_data[1:1+pf_len])
-
-                    # ALPN (Extension 16)
-                    elif ext_type == 16 and len(ext_data) >= 2:
-                        alpn_list_len = struct.unpack("!H", ext_data[0:2])[0]
-                        if len(ext_data) >= 3:
-                            first_len = ext_data[2]
-                            alpn = ext_data[3:3+first_len].decode("utf-8", errors="ignore")
-
-                    offset += ext_len
-
-            # 1. Compute JA3 Fingerprint:
-            # SSLVersion,Cipher,SSLExtension,EllipticCurve,EllipticCurvePointFormat
-            ciphers_str = "-".join(str(c) for c in ciphers)
-            exts_str = "-".join(str(e) for e in extensions)
-            curves_str = "-".join(str(cr) for cr in curves)
-            points_str = "-".join(str(pt) for pt in point_formats)
-
-            ja3_string = f"{client_version},{ciphers_str},{exts_str},{curves_str},{points_str}"
-            ja3_hash = hashlib.md5(ja3_string.encode("utf-8")).hexdigest()
-
-            # 2. Compute JA4 Fingerprint:
-            # t (TCP) + 13 (version) + d (sni exists: d, else i) + cipher_count + ext_count + alpn
-            proto = "t" # TCP
-            ver_map = {0x0303: "12", 0x0304: "13", 0x0302: "11", 0x0301: "10"}
-            v_str = ver_map.get(client_version, "00")
-            sni_flag = "d" if sni else "i"
-            c_cnt = f"{min(len(ciphers), 99):02d}"
-            e_cnt = f"{min(len(extensions), 99):02d}"
-            alpn_code = "00"
-            if alpn:
-                alpn_code = alpn[:2] if len(alpn) >= 2 else alpn + "0"
-
-            ja4_a = f"{proto}{v_str}{sni_flag}{c_cnt}{e_cnt}{alpn_code}"
-            
-            # Sorted ciphers hash (12 hex chars)
-            sorted_ciphers = ",".join(f"{c:04x}" for c in sorted(ciphers))
-            ja4_b = hashlib.sha256(sorted_ciphers.encode()).hexdigest()[:12] if ciphers else "000000000000"
-
-            # Sorted extensions hash (12 hex chars)
-            sorted_exts = ",".join(f"{e:04x}" for e in sorted(extensions))
-            ja4_c = hashlib.sha256(sorted_exts.encode()).hexdigest()[:12] if extensions else "000000000000"
-
-            ja4_string = f"{ja4_a}_{ja4_b}_{ja4_c}"
-
-            return {
-                "version": client_version,
-                "ciphers": ciphers,
-                "extensions": extensions,
-                "curves": curves,
-                "point_formats": point_formats,
-                "sni": sni,
-                "alpn": alpn,
-                "ja3_string": ja3_string,
-                "ja3_hash": ja3_hash,
-                "ja4_string": ja4_string
-            }
-        except Exception:
+            cursor = 0
+            def take(n):
+                nonlocal cursor
+                if n < 0 or cursor + n > len(hello):
+                    raise ValueError('Truncated ClientHello')
+                value = hello[cursor:cursor + n]
+                cursor += n
+                return value
+            def u16():
+                return int.from_bytes(take(2), 'big')
+            def vector16(buf, prefix=True):
+                if prefix:
+                    if len(buf) < 2 or int.from_bytes(buf[:2], 'big') != len(buf) - 2:
+                        raise ValueError('Invalid TLS vector')
+                    buf = buf[2:]
+                if len(buf) % 2:
+                    raise ValueError('Odd TLS vector length')
+                return [int.from_bytes(buf[i:i + 2], 'big') for i in range(0, len(buf), 2)
+                        if int.from_bytes(buf[i:i + 2], 'big') not in cls.GREASE_TABLE]
+            legacy_version = u16()
+            take(32)
+            take(take(1)[0])
+            ciphers = vector16(take(u16()), prefix=False)
+            take(take(1)[0])
+            extensions, curves, points, signatures, versions = [], [], [], [], []
+            sni = alpn = None
+            if cursor < len(hello):
+                remaining = u16()
+                if cursor + remaining != len(hello):
+                    raise ValueError('Invalid extension length')
+                end = cursor + remaining
+                while cursor < end:
+                    kind, size = u16(), u16()
+                    buf = take(size)
+                    if kind not in cls.GREASE_TABLE:
+                        extensions.append(kind)
+                    if kind == 0:
+                        if len(buf) < 5 or int.from_bytes(buf[:2], 'big') != len(buf) - 2:
+                            raise ValueError('Invalid SNI')
+                        if buf[2] == 0:
+                            size = int.from_bytes(buf[3:5], 'big')
+                            if size + 5 > len(buf):
+                                raise ValueError('Truncated SNI')
+                            sni = buf[5:5 + size].decode('ascii')
+                    elif kind == 10:
+                        curves = vector16(buf)
+                    elif kind == 11:
+                        if not buf or buf[0] != len(buf) - 1:
+                            raise ValueError('Invalid point formats')
+                        points = list(buf[1:])
+                    elif kind == 13:
+                        signatures = vector16(buf)
+                    elif kind == 16:
+                        if len(buf) < 3 or int.from_bytes(buf[:2], 'big') != len(buf) - 2 or buf[2] + 3 > len(buf):
+                            raise ValueError('Invalid ALPN')
+                        alpn = buf[3:3 + buf[2]].decode('ascii')
+                    elif kind == 43:
+                        if not buf or buf[0] != len(buf) - 1:
+                            raise ValueError('Invalid supported_versions')
+                        versions = vector16(buf[1:], prefix=False)
+            version = max(versions) if versions else legacy_version
+            ja3_string = ','.join([str(legacy_version), '-'.join(map(str, ciphers)),
+                                   '-'.join(map(str, extensions)), '-'.join(map(str, curves)), '-'.join(map(str, points))])
+            version_code = {0x0301: '10', 0x0302: '11', 0x0303: '12', 0x0304: '13'}.get(version, '00')
+            alpn_code = (alpn[0] + alpn[-1]) if alpn else '00'
+            if not alpn_code.isalnum():
+                alpn_code = alpn.encode().hex()[:2] if alpn else '00'
+            ja4_a = f"t{version_code}{'d' if sni else 'i'}{min(len(ciphers), 99):02d}{min(len(extensions), 99):02d}{alpn_code}"
+            sorted_ciphers = ','.join(f'{c:04x}' for c in sorted(ciphers))
+            # JA4 excludes SNI/ALPN extensions from c and appends signature algorithms in wire order.
+            ext_ids = ','.join(f'{e:04x}' for e in sorted(extensions) if e not in (0, 16))
+            sig_ids = ','.join(f'{s:04x}' for s in signatures)
+            c_input = ext_ids + ('_' + sig_ids if signatures else '')
+            b_hash = hashlib.sha256(sorted_ciphers.encode()).hexdigest()[:12] if ciphers else '0' * 12
+            c_hash = hashlib.sha256(c_input.encode()).hexdigest()[:12] if c_input else '0' * 12
+            return {'version': legacy_version, 'negotiation_version': version, 'ciphers': ciphers,
+                    'extensions': extensions, 'curves': curves, 'point_formats': points, 'sni': sni,
+                    'alpn': alpn, 'ja3_string': ja3_string, 'ja3_hash': hashlib.md5(ja3_string.encode()).hexdigest(),
+                    'ja4_string': f'{ja4_a}_{b_hash}_{c_hash}'}
+        except (ValueError, IndexError, UnicodeError, struct.error):
             return None

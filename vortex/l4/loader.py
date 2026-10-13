@@ -1,106 +1,156 @@
-"""
-L4 XDP / eBPF Kernel Loader & Blacklist Manager for Project VORTEX.
-Handles compiling, attaching/detaching XDP filters to network interfaces,
-and managing the BPF blacklisted_ips map.
-"""
+"""Optional XDP blacklist loader; unprivileged mode is explicitly userspace only."""
+import json
+import logging
 import os
-import subprocess
+import platform
 import socket
 import struct
+import subprocess
+import sysconfig
 import time
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Dict
 
-KERNEL_SRC = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../kernel/xdp_filter.c"))
-KERNEL_OBJ = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../kernel/xdp_filter.o"))
+log = logging.getLogger(__name__)
+_REPO_SOURCE = Path(__file__).resolve().parents[2] / "kernel" / "xdp_filter.c"
+_INSTALLED_SOURCE = Path(sysconfig.get_path("data")) / "share" / "vortex" / "kernel" / "xdp_filter.c"
+KERNEL_SRC = str(_REPO_SOURCE if _REPO_SOURCE.is_file() else _INSTALLED_SOURCE)
+KERNEL_OBJ = str(Path.home() / ".cache" / "vortex" / "xdp_filter.o")
+
 
 class XDPShieldManager:
-    def __init__(self, interface: str = "lo"):
+    def __init__(self, interface: str = "lo", max_blocked_ips: int = 65536):
+        if max_blocked_ips <= 0:
+            raise ValueError("max_blocked_ips must be positive")
         self.interface = interface
         self.attached = False
-        self.mode = "none" # "xdp", "fallback", "simulation"
-        self.local_blocked_ips: Dict[str, float] = {} # ip -> expire_time
-        self.stats = {
-            "rx_packets": 0,
-            "rx_bytes": 0,
-            "dropped_packets": 0,
-            "passed_packets": 0,
-        }
+        self.mode = "none"
+        self.max_blocked_ips = max_blocked_ips
+        self.local_blocked_ips: Dict[str, float] = {}
+        self.map_id = None
+        self.stats = {"rx_packets": 0, "rx_bytes": 0, "dropped_packets": 0, "passed_packets": 0}
 
     def compile_ebpf(self) -> bool:
-        """Compile the native C eBPF filter into BPF bytecode."""
-        if not os.path.exists(KERNEL_SRC):
+        if not os.path.isfile(KERNEL_SRC):
+            log.warning("XDP source is unavailable; using userspace mode")
             return False
-        
-        cmd = [
-            "clang", "-O2", "-g", "-target", "bpf",
-            "-D__TARGET_ARCH_x86", "-I/usr/include",
-            "-c", KERNEL_SRC, "-o", KERNEL_OBJ
-        ]
+        arch = {"x86_64": "x86", "aarch64": "arm64"}.get(platform.machine())
+        if arch is None:
+            log.warning("Unsupported eBPF build architecture: %s", platform.machine())
+            return False
+        Path(KERNEL_OBJ).parent.mkdir(parents=True, exist_ok=True)
+        cmd = ["clang", "-O2", "-g", "-target", "bpf", f"-D__TARGET_ARCH_{arch}", "-I/usr/include"]
+        multiarch = sysconfig.get_config_var("MULTIARCH")
+        if multiarch:
+            cmd.append(f"-I/usr/include/{multiarch}")
+        cmd.extend(["-c", KERNEL_SRC, "-o", KERNEL_OBJ])
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            return os.path.exists(KERNEL_OBJ)
-        except Exception as e:
+            subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
+            return os.path.isfile(KERNEL_OBJ)
+        except (OSError, subprocess.SubprocessError) as exc:
+            log.warning("eBPF compilation failed: %s", exc)
             return False
 
     def is_root(self) -> bool:
-        return os.geteuid() == 0
+        return hasattr(os, "geteuid") and os.geteuid() == 0
+
+    def _resolve_map_id(self):
+        """Resolve the map of OUR attached program, not a globally ambiguous map name."""
+        link = json.loads(subprocess.check_output(
+            ["ip", "-j", "-d", "link", "show", "dev", self.interface], timeout=10))[0]
+        xdp = link.get("xdp", {})
+        prog = xdp.get("prog", {})
+        prog_id = prog.get("id") or xdp.get("prog_id")
+        if not prog_id:
+            attached = xdp.get("attached", [])
+            if isinstance(attached, list):
+                prog_id = next((p.get("prog", {}).get("id") or p.get("id") for p in attached if isinstance(p, dict)), None)
+        if not prog_id:
+            raise RuntimeError("Cannot identify the attached XDP program")
+        program = json.loads(subprocess.check_output(["bpftool", "-j", "prog", "show", "id", str(prog_id)], timeout=10))
+        if isinstance(program, list):
+            program = program[0]
+        for map_id in program.get("map_ids", []):
+            info = json.loads(subprocess.check_output(["bpftool", "-j", "map", "show", "id", str(map_id)], timeout=10))
+            if isinstance(info, list):
+                info = info[0]
+            if info.get("name") == "blocked_ips":
+                self.map_id = map_id
+                return
+        raise RuntimeError("The attached program has no blocked_ips map")
 
     def attach(self) -> bool:
-        """Attempt to attach XDP filter to interface, fallback to userspace filter if unprivileged."""
-        if not os.path.exists(KERNEL_OBJ):
-            self.compile_ebpf()
-
-        if self.is_root():
+        # Always rebuild; never load the stale object previously committed to the repo.
+        if self.is_root() and self.compile_ebpf():
             try:
-                # Attempt attaching generic XDP via ip link
-                cmd = ["ip", "link", "set", "dev", self.interface, "xdpgeneric", "object", KERNEL_OBJ, "section", "xdp"]
-                subprocess.run(cmd, capture_output=True, check=True)
-                self.attached = True
-                self.mode = "xdp_generic"
+                # Do not replace another program installed by the host administrator.
+                link = json.loads(subprocess.check_output(["ip", "-j", "-d", "link", "show", "dev", self.interface], timeout=10))[0]
+                if link.get("xdp"):
+                    raise RuntimeError("An XDP program is already attached to this interface")
+                subprocess.run(["ip", "link", "set", "dev", self.interface, "xdpgeneric", "object", KERNEL_OBJ, "section", "xdp"],
+                               capture_output=True, check=True, timeout=10)
+                self.attached, self.mode = True, "xdp_generic"
+                self._resolve_map_id()
                 return True
-            except Exception:
-                pass
-
-        # Fallback to high-speed userspace L4 filter
-        self.attached = True
-        self.mode = "userspace_l4"
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+                log.warning("XDP attachment/map discovery failed: %s", exc)
+                if self.mode == "xdp_generic":
+                    self.detach()
+        self.attached, self.mode = True, "userspace_l4"
+        self.map_id = None
+        log.warning("Userspace-only filtering: no kernel-level or volumetric DDoS protection")
         return True
 
     def detach(self) -> bool:
-        """Detach XDP filter from interface."""
         if self.mode.startswith("xdp") and self.is_root():
             try:
-                cmd = ["ip", "link", "set", "dev", self.interface, "xdp", "off"]
-                subprocess.run(cmd, capture_output=True, check=True)
-            except Exception:
-                pass
-        self.attached = False
-        self.mode = "none"
+                subprocess.run(["ip", "link", "set", "dev", self.interface, "xdpgeneric", "off"],
+                               capture_output=True, check=True, timeout=10)
+            except (OSError, subprocess.SubprocessError) as exc:
+                log.error("Failed to detach XDP: %s", exc)
+                return False
+        self.attached, self.mode, self.map_id = False, "none", None
         return True
 
-    def block_ip(self, ip_str: str, duration_sec: int = 300) -> bool:
-        """Add IP to blacklist."""
-        expire = time.time() + duration_sec
-        self.local_blocked_ips[ip_str] = expire
+    def _prune_expired(self):
+        now = time.monotonic()
+        for ip, expiry in list(self.local_blocked_ips.items()):
+            if expiry <= now:
+                self.local_blocked_ips.pop(ip, None)
+                # The kernel also checks expiry on every packet, even before this cleanup.
+                if self.mode.startswith("xdp") and self.map_id is not None:
+                    try:
+                        key = [f"{b:02x}" for b in socket.inet_aton(ip)]
+                        subprocess.run(["bpftool", "map", "delete", "id", str(self.map_id), "key", "hex", *key],
+                                       capture_output=True, timeout=10)
+                    except (OSError, subprocess.SubprocessError):
+                        log.warning("Could not remove expired kernel map entry for %s", ip)
 
-        # If in kernel XDP mode and root, push to BPF map via bpftool
-        if self.mode.startswith("xdp") and self.is_root():
+    def block_ip(self, ip_str: str, duration_sec: int = 300) -> bool:
+        if duration_sec <= 0:
+            raise ValueError("duration_sec must be positive")
+        self._prune_expired()
+        if ip_str not in self.local_blocked_ips and len(self.local_blocked_ips) >= self.max_blocked_ips:
+            return False
+        self.local_blocked_ips[ip_str] = time.monotonic() + duration_sec
+        if self.mode.startswith("xdp") and self.map_id is not None:
             try:
-                ip_packed = socket.inet_aton(ip_str)
-                hex_key = " ".join(f"0x{b:02x}" for b in ip_packed)
-                cmd = ["bpftool", "map", "update", "name", "blocked_ips", "key", "hex", *hex_key.split(), "value", "hex", "0x00", "0x00", "0x00", "0x00", "0x00", "0x00", "0x00", "0x00"]
-                subprocess.run(cmd, capture_output=True)
-            except Exception:
-                pass
+                key = [f"{b:02x}" for b in socket.inet_aton(ip_str)]
+                # CLOCK_MONOTONIC matches bpf_ktime_get_ns. Pack in the target host's byte order.
+                value = [f"{b:02x}" for b in struct.pack("=QQ", time.monotonic_ns() + int(duration_sec * 1_000_000_000), 0)]
+                subprocess.run(["bpftool", "map", "update", "id", str(self.map_id), "key", "hex", *key, "value", "hex", *value],
+                               capture_output=True, check=True, timeout=10)
+            except (OSError, subprocess.SubprocessError) as exc:
+                log.warning("Kernel ban failed for %s; userspace ban remains: %s", ip_str, exc)
+                return False
         return True
 
     def is_ip_blocked(self, ip_str: str) -> bool:
-        """Check if IP is currently blacklisted and unexpire if needed."""
-        expire = self.local_blocked_ips.get(ip_str)
-        if not expire:
+        expiry = self.local_blocked_ips.get(ip_str)
+        if expiry is None:
             return False
-        if time.time() > expire:
-            del self.local_blocked_ips[ip_str]
+        if time.monotonic() >= expiry:
+            self._prune_expired()
             return False
         return True
 
@@ -113,9 +163,6 @@ class XDPShieldManager:
         self.stats["rx_bytes"] += byte_len
 
     def get_stats(self) -> dict:
-        return {
-            **self.stats,
-            "blocked_count": len(self.local_blocked_ips),
-            "mode": self.mode,
-            "interface": self.interface
-        }
+        self._prune_expired()
+        return {**self.stats, "blocked_count": len(self.local_blocked_ips), "mode": self.mode,
+                "interface": self.interface, "stats_source": "userspace_stream_events"}

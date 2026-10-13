@@ -8,10 +8,10 @@ from vortex.proxy.engine import VortexProxyEngine
 
 # Raw minimal ClientHello bytes sample
 SAMPLE_CLIENT_HELLO = (
-    b"\x16\x03\x01\x00\x4b\x01\x00\x00\x47\x03\x03"
+    b"\x16\x03\x01\x00\x4c\x01\x00\x00\x48\x03\x03"
     b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f"
     b"\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f"
-    b"\x00\x00\x04\x13\x01\x13\x02\x01\x00\x00\x1a\x00\x00\x00\x0f\x00"
+    b"\x00\x00\x04\x13\x01\x13\x02\x01\x00\x00\x1b\x00\x00\x00\x0f\x00"
     b"\x0d\x00\x00\x0a\x67\x6f\x6f\x67\x6c\x65\x2e\x63\x6f\x6d\x00\x0a"
     b"\x00\x04\x00\x02\x00\x1d"
 )
@@ -55,10 +55,11 @@ def test_rate_limiter_and_l4_escalation():
     assert allowed is False
     assert should_ban is True
 
-def test_xdp_shield_manager():
+def test_xdp_shield_manager(monkeypatch):
     shield = XDPShieldManager(interface="lo")
-    assert shield.compile_ebpf() is True
+    monkeypatch.setattr(shield, "is_root", lambda: False)
     assert shield.attach() is True
+    assert shield.mode == "userspace_l4"
     
     shield.block_ip("10.0.0.1", duration_sec=60)
     assert shield.is_ip_blocked("10.0.0.1") is True

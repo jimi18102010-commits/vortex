@@ -2,9 +2,10 @@ name: VORTEX CI
 
 on:
   push:
-    branches: [ main ]
   pull_request:
-    branches: [ main ]
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -33,7 +34,7 @@ jobs:
 
     - name: Compile eBPF XDP filter
       run: |
-        clang -O2 -g -target bpf -D__TARGET_ARCH_x86 -I/usr/include -c kernel/xdp_filter.c -o kernel/xdp_filter.o
+        clang -O2 -g -target bpf -D__TARGET_ARCH_x86 -I/usr/include -I/usr/include/$(gcc -dumpmachine) -c kernel/xdp_filter.c -o kernel/xdp_filter.o
 
     - name: Run pytest test suite
       run: |

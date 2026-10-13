@@ -1,56 +1,52 @@
-"""
-Sliding Window Token Bucket Rate Limiter with Automatic L4 Escalation.
-"""
+"""Bounded per-IP token buckets with a real 60-second violation window."""
 import time
 from typing import Dict, Tuple
 
+
 class SlidingWindowLimiter:
-    def __init__(self, capacity: int = 100, refill_rate: float = 20.0, ban_threshold: int = 200):
-        """
-        :param capacity: Max burst token capacity
-        :param refill_rate: Tokens added per second
-        :param ban_threshold: Violation count within a minute before escalating to kernel L4 ban
-        """
+    def __init__(self, capacity: int = 100, refill_rate: float = 20.0,
+                 ban_threshold: int = 200, max_entries: int = 65536,
+                 idle_ttl: float = 300.0):
+        if capacity <= 0 or refill_rate < 0 or ban_threshold <= 0 or max_entries <= 0 or idle_ttl <= 0:
+            raise ValueError("Invalid rate limiter configuration")
         self.capacity = capacity
         self.refill_rate = refill_rate
         self.ban_threshold = ban_threshold
-
-        # ip -> (tokens, last_update_time)
+        self.max_entries = max_entries
+        self.idle_ttl = idle_ttl
         self.buckets: Dict[str, Tuple[float, float]] = {}
-        # ip -> violation_count
         self.violations: Dict[str, int] = {}
-        # ip -> last_violation_reset
         self.violation_reset: Dict[str, float] = {}
+        self._last_cleanup = time.monotonic()
+
+    def _remove(self, ip):
+        self.buckets.pop(ip, None)
+        self.violations.pop(ip, None)
+        self.violation_reset.pop(ip, None)
 
     def allow(self, ip: str, cost: float = 1.0) -> Tuple[bool, bool]:
-        """
-        Check if an IP request is allowed.
-        Returns: (allowed: bool, should_escalate_l4_ban: bool)
-        """
-        now = time.time()
-        
-        # 1. Reset violations older than 60s
-        last_v_reset = self.violation_reset.get(ip, now)
-        if now - last_v_reset > 60.0:
+        if cost <= 0:
+            raise ValueError("cost must be positive")
+        now = time.monotonic()
+        if now - self._last_cleanup >= 60:
+            for key, (_, last) in list(self.buckets.items()):
+                if now - last > self.idle_ttl:
+                    self._remove(key)
+            self._last_cleanup = now
+        if ip not in self.buckets:
+            if len(self.buckets) >= self.max_entries:
+                # Fail closed rather than evicting an active IP's rate limit.
+                return False, False
+            self.violation_reset[ip] = now
+        if now - self.violation_reset.get(ip, now) >= 60:
             self.violations[ip] = 0
             self.violation_reset[ip] = now
-
-        # 2. Get or initialize token bucket
-        tokens, last_time = self.buckets.get(ip, (self.capacity, now))
-        
-        # 3. Refill tokens
-        elapsed = now - last_time
-        tokens = min(self.capacity, tokens + (elapsed * self.refill_rate))
-
+        tokens, last = self.buckets.get(ip, (self.capacity, now))
+        tokens = min(self.capacity, tokens + max(0.0, now - last) * self.refill_rate)
         if tokens >= cost:
-            tokens -= cost
-            self.buckets[ip] = (tokens, now)
+            self.buckets[ip] = (tokens - cost, now)
             return True, False
-        else:
-            # Over limit
-            self.buckets[ip] = (tokens, now)
-            curr_v = self.violations.get(ip, 0) + 1
-            self.violations[ip] = curr_v
-            
-            should_ban = curr_v >= self.ban_threshold
-            return False, should_ban
+        self.buckets[ip] = (tokens, now)
+        violations = self.violations.get(ip, 0) + 1
+        self.violations[ip] = violations
+        return False, violations >= self.ban_threshold
