@@ -9,12 +9,17 @@
 
 #define MAX_BLOCKED_IPS 65536
 
-/* Map to store blacklisted IPv4 addresses */
+struct ban_record {
+    __u64 expires_ns;
+    __u64 dropped_packets;
+};
+
+/* Bans expire in the kernel even when no Python cleanup runs. */
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, MAX_BLOCKED_IPS);
     __type(key, __u32);   /* IPv4 in network byte order */
-    __type(value, __u64); /* Drop counter / timestamp */
+    __type(value, struct ban_record);
 } blocked_ips SEC(".maps");
 
 /* Map to store global statistics */
@@ -67,16 +72,20 @@ int xdp_vortex_shield(struct xdp_md *ctx) {
     __u32 src_ip = ip->saddr;
 
     /* 3. Check Blacklist BPF Map (O(1) lookup in kernel) */
-    __u64 *drop_count = bpf_map_lookup_elem(&blocked_ips, &src_ip);
-    if (drop_count) {
-        __sync_fetch_and_add(drop_count, 1);
+    struct ban_record *ban = bpf_map_lookup_elem(&blocked_ips, &src_ip);
+    if (ban && bpf_ktime_get_ns() >= ban->expires_ns) {
+        bpf_map_delete_elem(&blocked_ips, &src_ip);
+        ban = 0;
+    }
+    if (ban) {
+        __sync_fetch_and_add(&ban->dropped_packets, 1);
         if (stats) {
             __sync_fetch_and_add(&stats->dropped_packets, 1);
         }
         return XDP_DROP; /* ZERO-COPY WIRE DROP */
     }
 
-    /* 4. Malformed packet mitigation (SYN-flood without payload, NULL scan, XMAS scan) */
+    /* 4. Basic malformed TCP flag checks; this is NOT a SYN-flood limiter. */
     if (ip->protocol == IPPROTO_TCP) {
         struct tcphdr *tcp = (void *)((char *)ip + (ip->ihl * 4));
         if ((void *)(tcp + 1) <= data_end) {

@@ -1,0 +1,3 @@
+include kernel/xdp_filter.c
+global-exclude *.py[cod]
+global-exclude *.o
