@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [
-    { name = "jimmiy", email = "jimi18102010@gmail.com" }
+    { name = "Jimmy", email = "jimi18102010@gmail.com" }
 ]
 keywords = ["ebpf", "xdp", "reverse-proxy", "ddos-mitigation", "ja4", "ja3", "security", "cloudflare-alternative"]
 dependencies = [
