@@ -103,4 +103,4 @@ vortex test-attack --port 8080 --concurrency 50 --requests 500
 
 ## 📄 License
 
-MIT License. Designed & engineered by **Jimmiy** (2026).
+MIT License. Designed & engineered by **Jimmy** (2026).
